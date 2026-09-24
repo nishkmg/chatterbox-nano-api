@@ -10,6 +10,9 @@ ENV OMP_NUM_THREADS=2
 ENV MKL_NUM_THREADS=2
 ENV OPENBLAS_NUM_THREADS=2
 
+# Keep the HF cache on the model volume so the tokenizer survives redeploys
+ENV HF_HOME=/app/model/.hf
+
 # Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \

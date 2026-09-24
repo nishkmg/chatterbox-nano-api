@@ -1,10 +1,9 @@
 # AGENTS.md — chatterbox-nano-api
 
-Single-file FastAPI server (`app.py`, ~143 lines) wrapping the four ONNX graphs of Chatterbox-Nano for text-to-speech with voice cloning. CPU only, shipped as a Docker image. No tests, no lint, no typecheck, no CI.
+Single-file FastAPI server (`app.py`, ~240 lines) wrapping the four ONNX graphs of Chatterbox-Nano for text-to-speech with voice cloning. CPU only, shipped as a Docker image.
 
-**`/generate` currently returns 501.** The autoregressive LM loop was deliberately removed because the old single-forward-pass version produced garbage audio. Port the loop from the model repo's `run_onnx.py`. Startup, tokenizer, and health all work; only synthesis is missing.
-
-- App: `app.py` — lifespan downloads the model snapshot, builds four `onnxruntime` sessions, and loads `AutoTokenizer`. Endpoints: `POST /generate` (501 until implemented) and `GET /health`.
+- App: `app.py` — lifespan downloads the model snapshot, builds four `onnxruntime` sessions, loads `GPT2TokenizerFast`. Endpoints: `POST /generate` (TTS → WAV stream) and `GET /health`.
+- `tools/verify_pipeline.py` — offline checks for the generation math (KV cache, sampling, penalty). No model download needed. This is the only real test gate; run it after touching `generate_speech`.
 - `Dockerfile` — `python:3.11-slim`, thread env vars pinned to 2 (2-vCPU target), installs `ffmpeg`+`libsndfile1`, `uvicorn app:app --port 8000 --workers 1`, `EXPOSE 8000`, `/health` healthcheck with `--start-period 120s`.
 - `voices/` — voice-reference WAVs. Tracked via `voices/.gitkeep`; `.gitignore` excludes `voices/*.wav` so reference audio stays local and never lands in the public repo.
 
@@ -25,29 +24,37 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 MODEL_DIR="$PWD/model" uvicorn app:app --port 8000 --workers 1
 
-# Verify. /health is the only runtime gate; /generate will 501.
+# Verify. No model download required.
+python3 tools/verify_pipeline.py
+
+# Runtime smoke test once /health reports all four sessions
 curl -s localhost:8000/health
+curl -s -X POST localhost:8000/generate \
+  -H 'content-type: application/json' \
+  -d '{"text":"Hello.","voice_reference":"'"$PWD"'/voices/ref.wav","seed":1337}' \
+  -o out.wav
 ```
 
-There is no lint, typecheck, test, or formatter. `python3 -c "import ast; ast.parse(open('app.py').read())"` is the only syntax gate. First boot downloads the ONNX graphs (the bulk of the ~547 MiB repo) before the server binds.
+There is no lint, typecheck, formatter, or CI. `tools/verify_pipeline.py` plus `GET /health` are the only gates. First boot downloads the ONNX graphs (the bulk of the ~547 MiB repo) before the server binds.
 
-## Implementing `generate_speech`
+## The generation loop
 
-Port from `run_onnx.py` in `owensong/chatterbox-nano-ONNX`. Constraints already encoded in the code:
+Ported from `run_onnx.py` in `owensong/chatterbox-nano-ONNX` (now fetched into `MODEL_DIR` and gitignored). If you change it, re-run `tools/verify_pipeline.py` — it pins the parts that are easy to break:
 
-- Bind tensors **by name**. `_bind()` is defined but unused — it is the intended entry point and raises loudly on graph drift. `load_sessions()` logs every session's input/output names at startup; read that log before guessing names.
-- The model is autoregressive over speech tokens with a 12-layer KV cache. Special IDs: start 6561, stop 6562, decoder silence padding 4299. `max_new_tokens` and `repetition_penalty` are accepted by the request model and threaded through to `generate_speech` — wire them to the loop, don't drop them.
-- **The 24 kHz reference-audio check was lost in the rewrite.** `sf.read` is no longer called anywhere; `SAMPLE_RATE` is only used for writing output. Re-add `sf.read` + mono downmix + `if sr != SAMPLE_RATE: raise` before the encoder, or the speech encoder silently gets mismatched-rate conditioning.
-- `tokenizer` is a module global loaded in lifespan. Use it; don't re-instantiate per request.
+- **Cache output offset is `outputs[index + 1]`.** LM outputs are `[logits, k0, v0, k1, v1, …]`, so the first cache tensor is `outputs[1]`, not `outputs[0]`. Off-by-one here silently feeds every layer the wrong KV tensor and yields garbage audio with no error.
+- **The first pass feeds `audio_features + text_embeds` concatenated** (the reference conditioning prefix); every later pass feeds exactly **one** token. `attention_mask` and `position_ids` must grow in lockstep with the cache.
+- **`_empty_cache` expects exactly 24 inputs** (12 layers × K,V) named `past_key_values.*`, each seeded as `(batch, heads, 0, head_dim)` — zero-length sequence. It raises on any other count so graph drift is loud.
+- Special IDs: start 6561, stop 6562, decoder silence padding 4299. On STOP, the token is stripped and 3 silence tokens are appended to the decoder input.
+- Tensors bind **by name** through `_bind()`, which raises if a name is missing. `load_sessions()` logs every session's input/output names at startup — read that log before guessing.
 
 ## Gotchas that will bite you
 
 - **`MODEL_DIR` defaults to the absolute container path `/app/model`.** Not CWD-relative. On bare metal that is a permission error for a non-root user — always set `MODEL_DIR` explicitly outside Docker.
-- **The tokenizer does not live in `MODEL_DIR`.** `AutoTokenizer.from_pretrained(MODEL_REPO)` uses the default HF cache (`~/.cache/huggingface`), so it re-downloads on every cold start even when `/app/model` is a persistent volume. Point `HF_HOME` at the same volume if you want start-up to be network-free.
-- **`ALLOW_PATTERNS` excludes `run_onnx.py`** — the reference implementation you need to port the loop from. Fetch it explicitly (`hf download owensong/chatterbox-nano-ONNX run_onnx.py`) or read it on the model card; don't assume it is sitting in `MODEL_DIR`.
-- `ALLOW_PATTERNS` does keep `onnx/*.onnx_data`, which the quantized graphs require beside their `.onnx`. Keep those sidecars; dropping them breaks session load.
-- `MODEL_REVISION` defaults to `main`, not a commit hash. Pin it before relying on reproducible output — a moving tag plus `ORT_ENABLE_ALL` can change results between deploys.
-- **Startup fails fast if `DEFAULT_VOICE` points at a missing file** (lifespan raises). On a volume-backed deploy this reads as a crashloop until the WAV is uploaded. If `DEFAULT_VOICE` is unset you instead get a warning and every request must carry `voice_reference`.
+- **Generation is serialized by a lock and run via `run_in_threadpool`.** ONNX Runtime sessions aren't safe for concurrent `run()`, and a 256-token autoregressive loop is slow enough to starve the event loop if called inline. Keep both. Throughput is one request at a time by design; raise `max_new_tokens` before adding workers.
+- **The voice reference must be 24 kHz.** `generate_speech` reads it with `sf.read`, downmixes stereo, and raises on any other rate. The encoder has no resampling stage — resample upstream rather than removing the check.
+- **`MODEL_REVISION` defaults to `main`, not a commit hash.** Pin it before relying on reproducible output; a moving tag plus `ORT_ENABLE_ALL` can change results between deploys.
+- **Startup fails fast if `DEFAULT_VOICE` points at a missing file** (lifespan raises). On a volume-backed deploy this reads as a crashloop until the WAV is uploaded. If unset you get a warning and every request must carry `voice_reference`.
+- Sampling is stochastic by default (`temperature=0.8`). Pass `seed` for reproducible output, or `temperature=0` for greedy. `temperature`, `top_k`, `top_p`, and `seed` are request fields.
 - No `HF_TOKEN` needed — the model repo is public. Rate limits can still make a cold start slow.
 
 ## Deploy
@@ -56,8 +63,8 @@ Target: **Coolify on a 2 vCPU / 12 GB RAM VPS**, deployed from the Dockerfile. T
 
 - Origin: public repo `nishkmg/chatterbox-nano-api`, branch `main`. Clone: `git@github.com:nishkmg/chatterbox-nano-api.git`.
 - Coolify service config: port `8000`, health check path `/health`, no build command (Dockerfile handles it).
-- Mount two volumes: `/app/voices` (reference WAVs) and `/app/model` (ONNX snapshot). Without the model volume the ~500 MiB download repeats on every redeploy.
-- Set `DEFAULT_VOICE=/app/voices/<file>.wav`, `MODEL_DIR=/app/model`, and `HF_HOME=/app/model/.hf` as service env vars.
+- Mount two volumes: `/app/voices` (reference WAVs) and `/app/model` (ONNX snapshot + `.hf` cache). Without the model volume the ~500 MiB download repeats on every redeploy.
+- Set `DEFAULT_VOICE=/app/voices/<file>.wav`, `MODEL_DIR=/app/model`, `HF_HOME=/app/model/.hf`, and a pinned `MODEL_REVISION` as service env vars.
 - The Dockerfile's `HEALTHCHECK --start-period=120s` can be shorter than a cold model download. If Coolify reports the deploy unhealthy, it is the first-boot download, not a real failure — pre-warm the model volume to avoid it.
 
 ## Local filesystem
