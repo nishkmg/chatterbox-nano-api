@@ -5,7 +5,7 @@ Single-file FastAPI server (`app.py`, ~176 lines) that wraps the four ONNX graph
 - App: `app.py` — FastAPI app, lifespan loads the ONNX sessions on startup. Endpoints: `POST /generate` (TTS → WAV stream) and `GET /health`.
 - `Dockerfile` — `python:3.11-slim`, pins thread env vars to 2 (2-vCPU target), installs `ffmpeg`+`libsndfile1`, runs `uvicorn app:app --port 8000 --workers 1`, `EXPOSE 8000`, `/health` healthcheck (start-period 120s).
 - `requirements.txt` — runtime deps only.
-- `voices/` — intended home for voice-reference WAVs. Currently empty and not tracked by git (empty dirs aren't).
+- `voices/` — intended home for voice-reference WAVs. Tracked via `voices/.gitkeep` (git can't store an empty dir); `.gitignore` excludes `voices/*.wav`, so reference audio stays local and never lands in the public repo.
 
 ## Commands
 
