@@ -1,0 +1,8 @@
+fastapi>=0.110
+uvicorn[standard]>=0.29
+onnxruntime>=1.18
+numpy>=1.26
+soundfile>=0.12
+librosa>=0.10
+huggingface_hub>=0.20
+pydantic>=2.0

@@ -1,0 +1,22 @@
+# AppleDouble resource-fork shadows (exFAT/CrucialSSD volume)
+._*
+.AppleDouble
+.LSOverride
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# HF model snapshot (~547 MiB, downloaded at startup into ./model)
+model/
+
+# Voice references are user data, not source
+voices/*.wav
+
+# Generated audio
+out.wav
