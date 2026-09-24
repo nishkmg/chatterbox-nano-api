@@ -1,176 +1,143 @@
 import os
 import io
-import time
 import numpy as np
 import soundfile as sf
 import onnxruntime as ort
-from huggingface_hub import hf_hub_download, snapshot_download
+from huggingface_hub import snapshot_download
+from transformers import AutoTokenizer
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
 
-# ---------- Configuration ----------
 MODEL_REPO = os.getenv("MODEL_REPO", "owensong/chatterbox-nano-ONNX")
+MODEL_REVISION = os.getenv("MODEL_REVISION", "main")   # pin a commit hash for reproducibility
+MODEL_DIR = os.path.abspath(os.getenv("MODEL_DIR", "/app/model"))
 SAMPLE_RATE = 24000
 MAX_NEW_TOKENS = int(os.getenv("MAX_NEW_TOKENS", "256"))
 
-# Four ONNX sessions (see model card[reference:1])
+# Only fetch what we need. .onnx_data sidecars ARE required for quantized graphs.
+ALLOW_PATTERNS = [
+    "onnx/*.onnx",
+    "onnx/*.onnx_data",
+    "tokenizer*",
+    "vocab*",
+    "merges*",
+    "special_tokens*",
+    "*.json",
+]
+
 MODEL_FILES = {
-    "embed_tokens": "embed_tokens_fp16.onnx",
-    "speech_encoder": "speech_encoder_q4f16.onnx",
-    "language_model": "language_model_q4f16.onnx",
+    "embed_tokens":        "embed_tokens_fp16.onnx",
+    "speech_encoder":      "speech_encoder_q4f16.onnx",
+    "language_model":      "language_model_q4f16.onnx",
     "conditional_decoder": "conditional_decoder_q4.onnx",
 }
 
-# ---------- Global sessions ----------
 sessions: dict[str, ort.InferenceSession] = {}
+tokenizer = None
 
-def load_onnx_sessions() -> dict[str, ort.InferenceSession]:
-    """Download and load all four ONNX graphs."""
-    local_dir = snapshot_download(repo_id=MODEL_REPO, local_dir="model")
-    onnx_dir = os.path.join(local_dir, "onnx")
+def load_sessions():
+    snapshot_download(
+        repo_id=MODEL_REPO,
+        revision=MODEL_REVISION,
+        local_dir=MODEL_DIR,
+        allow_patterns=ALLOW_PATTERNS,
+    )
+    onnx_dir = os.path.join(MODEL_DIR, "onnx")
 
-    sess_options = ort.SessionOptions()
-    # Limit threads to 2 to match the 2 vCPU VPS
-    sess_options.intra_op_num_threads = int(os.getenv("OMP_NUM_THREADS", "2"))
-    sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    opts = ort.SessionOptions()
+    opts.intra_op_num_threads = int(os.getenv("OMP_NUM_THREADS", "2"))
+    opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
 
     loaded = {}
     for name, filename in MODEL_FILES.items():
         path = os.path.join(onnx_dir, filename)
         if not os.path.exists(path):
-            raise FileNotFoundError(f"Missing ONNX file: {path}")
-        loaded[name] = ort.InferenceSession(
-            path,
-            sess_options=sess_options,
-            providers=["CPUExecutionProvider"],
-        )
-        print(f"Loaded {name} from {path}")
+            raise FileNotFoundError(f"missing ONNX graph: {path}")
+        sess = ort.InferenceSession(path, sess_options=opts, providers=["CPUExecutionProvider"])
+        loaded[name] = sess
+        # Log signatures so misroutes are visible at startup, not at inference time.
+        print(f"[{name}] inputs : {[i.name for i in sess.get_inputs()]}")
+        print(f"[{name}] outputs: {[o.name for o in sess.get_outputs()]}")
     return loaded
 
-# ---------- Lifespan (startup) ----------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global sessions
-    print("Loading Chatterbox-Nano ONNX sessions...")
-    sessions = load_onnx_sessions()
-    print("All ONNX sessions ready.")
+    global sessions, tokenizer
+    sessions = load_sessions()
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_REPO, revision=MODEL_REVISION)
+
+    # Fail fast on missing voice reference.
+    default_voice = os.getenv("DEFAULT_VOICE")
+    if default_voice and not os.path.exists(default_voice):
+        raise RuntimeError(f"DEFAULT_VOICE set to {default_voice} but file not found")
+    if not default_voice:
+        print("WARNING: DEFAULT_VOICE not set; every /generate must supply voice_reference")
+
     yield
     sessions.clear()
 
 app = FastAPI(title="Chatterbox-Nano ONNX TTS", lifespan=lifespan)
 
-# ---------- Request / Response models ----------
 class TTSRequest(BaseModel):
     text: str
-    voice_reference: str | None = None   # path or base64? For simplicity: path
+    voice_reference: str | None = None
     max_new_tokens: int = MAX_NEW_TOKENS
     repetition_penalty: float = 1.2
 
-# ---------- Core generation ----------
-def generate_speech(
-    text: str,
-    voice_reference: str,
-    max_new_tokens: int = MAX_NEW_TOKENS,
-    repetition_penalty: float = 1.2,
-) -> np.ndarray:
-    """
-    Run the full four-session Chatterbox-Nano pipeline.
-    Mirrors the logic from the community ONNX examples.
-    """
-    # 1. Load voice reference audio
-    audio, sr = sf.read(voice_reference, dtype="float32")
-    if audio.ndim > 1:
-        audio = audio.mean(axis=1)  # mono
-    if sr != SAMPLE_RATE:
-        raise ValueError(f"Voice reference must be {SAMPLE_RATE} Hz, got {sr}")
-    # shape: (1, T)
-    audio_values = audio[np.newaxis, :].astype(np.float32)
-
-    # 2. Tokenize text
-    #    The ONNX package includes a tokenizer; we use the embed_tokens session
-    #    indirectly. For a minimal implementation, we rely on the tokenizer
-    #    shipped with the model. If not available, a simple fallback is used.
-    #    (See model card: requires orchestration across four ONNX sessions.)
-    #    For brevity we assume the tokenizer is available via transformers.
-    try:
-        from transformers import AutoTokenizer
-        tokenizer = AutoTokenizer.from_pretrained(MODEL_REPO)
-        input_ids = tokenizer(text, return_tensors="np")["input_ids"].astype(np.int64)
-    except Exception as exc:
+def _bind(sess: ort.InferenceSession, **kwargs):
+    """Bind tensors by name; raise if the graph doesn't expose the expected inputs."""
+    expected = {i.name for i in sess.get_inputs()}
+    missing = set(kwargs) - expected
+    if missing:
         raise RuntimeError(
-            "Tokenizer not available. Install `transformers` and ensure the "
-            "model repo includes tokenizer files."
-        ) from exc
+            f"ONNX graph inputs {expected} do not match provided keys {set(kwargs)}. "
+            f"Model repo layout has likely changed."
+        )
+    return sess.run(None, kwargs)
 
-    # 3. Embed tokens
-    embed_inputs = {sessions["embed_tokens"].get_inputs()[0].name: input_ids}
-    text_embeds = sessions["embed_tokens"].run(None, embed_inputs)[0]
+def generate_speech(text: str, voice_reference: str, max_new_tokens: int, repetition_penalty: float) -> np.ndarray:
+    """
+    Full autoregressive pipeline. NOT YET IMPLEMENTED.
 
-    # 4. Encode voice reference
-    speech_inputs = {sessions["speech_encoder"].get_inputs()[0].name: audio_values}
-    speaker_embeds = sessions["speech_encoder"].run(None, speech_inputs)[0]
+    The single-forward-pass placeholder that was here before produced garbage.
+    A correct implementation must:
+      1. embed text tokens  -> embed_tokens
+      2. encode voice ref   -> speech_encoder
+      3. loop the LM token-by-token with KV cache, sampling with repetition_penalty
+      4. decode final token sequence -> conditional_decoder -> waveform
 
-    # 5. Autoregressive language model loop (simplified)
-    #    In practice, the language model consumes text embeddings and speaker
-    #    embeddings to produce speech tokens. The exact KV-cache management is
-    #    handled internally by the ONNX graph. We provide a minimal input and
-    #    run it for `max_new_tokens` steps.
-    lm_inputs = {
-        sessions["language_model"].get_inputs()[0].name: text_embeds,
-        sessions["language_model"].get_inputs()[1].name: speaker_embeds,
-    }
-    # For a deterministic first pass, generate a fixed number of tokens.
-    # A full implementation would loop with KV-cache.
-    lm_outputs = sessions["language_model"].run(None, lm_inputs)
-    speech_tokens = lm_outputs[0]
+    Port the loop from the model repo's `run_onnx.py` (it is the reference
+    implementation for these four graphs). The signatures logged at startup
+    will tell you the exact input/output names to bind.
+    """
+    raise NotImplementedError(
+        "Autoregressive LM loop not yet ported. See run_onnx.py in "
+        f"{MODEL_REPO} for the reference implementation."
+    )
 
-    # 6. Decode to waveform
-    decoder_inputs = {
-        sessions["conditional_decoder"].get_inputs()[0].name: speech_tokens
-    }
-    waveform = sessions["conditional_decoder"].run(None, decoder_inputs)[0]
-
-    # Ensure shape (T,) and float32
-    waveform = waveform.squeeze().astype(np.float32)
-    return waveform
-
-# ---------- Endpoint ----------
 @app.post("/generate")
 async def generate(request: TTSRequest):
-    if "embed_tokens" not in sessions:
-        raise HTTPException(status_code=503, detail="Model not loaded yet")
-
-    # Use a default reference if none provided
-    ref_path = request.voice_reference or os.getenv("DEFAULT_VOICE", "reference.wav")
-    if not os.path.exists(ref_path):
-        raise HTTPException(
-            status_code=400,
-            detail=f"Voice reference not found: {ref_path}",
-        )
+    ref = request.voice_reference or os.getenv("DEFAULT_VOICE")
+    if not ref:
+        raise HTTPException(400, "No voice_reference supplied and DEFAULT_VOICE is unset")
+    if not os.path.exists(ref):
+        raise HTTPException(400, f"voice_reference not found: {ref}")
 
     try:
-        waveform = generate_speech(
-            text=request.text,
-            voice_reference=ref_path,
-            max_new_tokens=request.max_new_tokens,
-            repetition_penalty=request.repetition_penalty,
-        )
+        waveform = generate_speech(request.text, ref, request.max_new_tokens, request.repetition_penalty)
+    except NotImplementedError as exc:
+        raise HTTPException(501, str(exc))
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+        raise HTTPException(500, str(exc))
 
-    # Write to an in-memory WAV buffer
     buf = io.BytesIO()
     sf.write(buf, waveform, SAMPLE_RATE, format="WAV")
     buf.seek(0)
-
-    return StreamingResponse(
-        buf,
-        media_type="audio/wav",
-        headers={"Content-Disposition": "attachment; filename=output.wav"},
-    )
+    return StreamingResponse(buf, media_type="audio/wav",
+                             headers={"Content-Disposition": "attachment; filename=output.wav"})
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "sessions": list(sessions.keys())}
+    return {"status": "ok", "sessions": list(sessions.keys()), "tokenizer": tokenizer is not None}
