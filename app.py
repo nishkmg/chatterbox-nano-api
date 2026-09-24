@@ -63,7 +63,11 @@ def load_sessions():
 
     opts = ort.SessionOptions()
     opts.intra_op_num_threads = int(os.getenv("OMP_NUM_THREADS", "2"))
-    opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    # ORT_ENABLE_ALL runs the NCHWc layout transform. On CPU, it rewrites this
+    # model's FP16 AveragePool-19 nodes to com.ms.internal.nhwc, which has no
+    # compatible CPU kernel and prevents session initialization.
+    opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_EXTENDED
+    print(f"ONNX Runtime {ort.__version__}; graph optimization: extended")
 
     loaded = {}
     for name, filename in MODEL_FILES.items():
